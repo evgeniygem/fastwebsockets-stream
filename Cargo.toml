@@ -2,11 +2,16 @@
 name = "fastwebsockets-stream"
 version = "0.1.0"
 edition = "2024"
-description = ""
-readme = "README.md"
+authors = ["Evgeniy Zakharov <eugenezakharov7@gmail.com"]
+description = """
+An adapter that exposes fastwebsockets::WebSocket as a Tokio AsyncRead/AsyncWrite stream.
+"""
 repository = "https://github.com/evgeniygem/fastwebsockets-stream"
-keywords = ["async", "websocket", "io", "web"]
-categories = ["asynchronous", "web-programming", "network-programming"]
+homepage = "https://github.com/evgeniygem/fastwebsockets-stream"
+documentation = "https://docs.rs/fastwebsockets-stream"
+readme = "README.md"
+keywords = ["websocket", "tokio", "fastwebsockets", "stream", "async"]
+categories = ["asynchronous", "network-programming", "web-programming"]
 license = "MIT"
 
 [dependencies]
