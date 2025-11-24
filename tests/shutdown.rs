@@ -167,7 +167,7 @@ async fn handle(mut request: Request<Incoming>) -> Result<Response<Empty<Bytes>>
 
         // Read the incoming message from the client into the buffer.
         // This expects exactly 6 bytes to match the "Hello!" message.
-        ws_stream.read(&mut buf).await.unwrap();
+        let _ = ws_stream.read(&mut buf).await.unwrap();
 
         // Initiate graceful shutdown of the WebSocket stream.
         // This should send a Close frame to the client and terminate the connection.
