@@ -44,13 +44,36 @@ enum ReadState<S> {
 /// Write state machine for `WebSocketStream`.
 ///
 /// Similar to `ReadState`, but represents a write operation that owns the
-/// websocket until it completes.
+/// websocket until it completes. This single state is shared by regular
+/// writes, flushes, and the close performed by `poll_shutdown` — see
+/// [`PendingOp`] for how we keep track of which one is actually in flight.
 enum WriteState<S> {
     /// No write in progress.
     Idle,
-    /// A boxed future that owns the websocket and will complete the write,
-    /// returning the websocket.
+    /// A boxed future that owns the websocket and will complete the
+    /// operation, returning the websocket.
     Writing(BoxFuture<'static, FutureResult<S, ()>>),
+}
+
+/// Describes which operation the future stored in `WriteState::Writing`
+/// actually represents.
+///
+/// `poll_write`, `poll_flush`, and `poll_shutdown` all funnel through the
+/// same `WriteState`, so it is possible for one of them to find an
+/// in-flight future that a *different* method started (e.g. `poll_flush`
+/// is called while a previous `poll_write` call is still pending). Tracking
+/// the operation kind alongside the future lets every caller correctly wait
+/// for whatever is in flight and then do its own job, instead of
+/// misreporting someone else's operation as its own (e.g. reporting a
+/// flush's completion as "0 bytes written").
+enum PendingOp {
+    /// A plain data write; carries the number of bytes to report once the
+    /// underlying frame has actually been written.
+    Write(usize),
+    /// A flush requested via `poll_flush`.
+    Flush,
+    /// A close frame written by `poll_shutdown`.
+    Close,
 }
 
 /// Stream payload type.
@@ -272,11 +295,11 @@ pub struct WebSocketStream<S> {
     /// State machine for an in-progress write future that owns the websocket
     write_state: WriteState<S>,
 
-    /// If `Some(n)` then a write is in progress and intends to report `n` bytes
-    /// written when the write future completes. We store the length separately
-    /// because the actual write future only stores the websocket and the
-    /// payload it sent
-    pending_write_len: Option<usize>,
+    /// If `Some(op)`, an operation is in progress in `write_state` and `op`
+    /// records which one (write/flush/close) so its completion can be
+    /// reported correctly regardless of which method ends up driving it to
+    /// completion.
+    pending_op: Option<PendingOp>,
 
     /// Expected and emitted payload type (Text or Binary). Received frames with
     /// a different data opcode are treated as errors
@@ -309,7 +332,7 @@ where
             read_buf: BytesMut::with_capacity(8 * 1024),
             read_state: ReadState::Idle,
             write_state: WriteState::Idle,
-            pending_write_len: None,
+            pending_op: None,
             payload_type,
             closed: false,
         }
@@ -333,6 +356,35 @@ where
     /// stream reached EOF.
     pub fn is_closed(&self) -> bool {
         self.closed
+    }
+
+    /// Drives whatever operation currently owns `write_state` (if any) to
+    /// completion, restoring the websocket and returning which [`PendingOp`]
+    /// just finished.
+    ///
+    /// Returns `Poll::Ready(Ok(None))` immediately if nothing is in flight.
+    /// Callers (`poll_write`, `poll_flush`, `poll_shutdown`) are responsible
+    /// for checking whether the returned `PendingOp` is the one they care
+    /// about; if it isn't (e.g. `poll_flush` drained a plain write that a
+    /// previous call started), they should loop and call this again so
+    /// their own operation actually gets started and driven.
+    fn poll_drive(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<PendingOp>>> {
+        match &mut self.write_state {
+            WriteState::Idle => Poll::Ready(Ok(None)),
+            WriteState::Writing(fut) => match fut.as_mut().poll(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Ok((websocket, ()))) => {
+                    self.websocket = Some(websocket);
+                    self.write_state = WriteState::Idle;
+                    Poll::Ready(Ok(self.pending_op.take()))
+                }
+                Poll::Ready(Err(e)) => {
+                    self.write_state = WriteState::Idle;
+                    self.pending_op = None;
+                    Poll::Ready(Err(make_io_err(e)))
+                }
+            },
+        }
     }
 }
 
@@ -374,8 +426,7 @@ where
                 ReadState::Reading(fut) => {
                     // Poll the future. If Pending, return Pending. If Ready,
                     // reinstate websocket and handle frame.
-                    let mut future_pin = unsafe { Pin::new_unchecked(fut) };
-                    match future_pin.as_mut().poll(cx) {
+                    match fut.as_mut().poll(cx) {
                         Poll::Pending => return Poll::Pending,
                         Poll::Ready(res) => {
                             // Transition back to Idle
@@ -386,10 +437,10 @@ where
                                     self.websocket = Some(websocket);
 
                                     match frame.opcode {
-                                        OpCode::Binary | OpCode::Text => {
-                                            // If frame payload type isn't match the desired type,
-                                            // return error
-                                            if frame.opcode != self.payload_type.into() {
+                                        OpCode::Binary | OpCode::Text | OpCode::Continuation => {
+                                            if matches!(frame.opcode, OpCode::Binary | OpCode::Text)
+                                                && frame.opcode != self.payload_type.into()
+                                            {
                                                 return Poll::Ready(Err(io::Error::other(
                                                     "The received data type is different \
                                                     from the stream data type",
@@ -422,7 +473,8 @@ where
                                             return Poll::Ready(Ok(()));
                                         }
                                         _ => {
-                                            // Ignore control frames and loop to read next frame
+                                            // Ignore control frames (Ping/Pong) and loop to
+                                            // read the next frame.
                                             continue;
                                         }
                                     }
@@ -450,11 +502,20 @@ where
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        // If there's already a write-in progress, poll it.
         loop {
-            match &mut self.write_state {
-                WriteState::Idle => {
-                    // Start a new write: take websocket and create future that writes
+            match self.poll_drive(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Ready(Ok(Some(PendingOp::Write(n)))) => return Poll::Ready(Ok(n)),
+                Poll::Ready(Ok(Some(_))) => {
+                    // A flush/close that a previous call started just finished;
+                    // write_state is Idle again, loop around to actually start
+                    // the write this call was asked to perform.
+                    continue;
+                }
+                Poll::Ready(Ok(None)) => {
+                    // Nothing in flight: start a new write, taking the websocket
+                    // and creating a future that writes it.
                     let websocket = match self.websocket.take() {
                         Some(websocket) => websocket,
                         None => {
@@ -462,128 +523,67 @@ where
                         }
                     };
 
-                    // Copy buffer into owned Vec so the future can own it
+                    // Copy buffer into an owned BytesMut so the future can own it.
                     let payload = BytesMut::from(buf);
                     let len = payload.len();
-                    let future = write(websocket, payload, self.payload_type);
-                    self.pending_write_len = Some(len);
-                    self.write_state = WriteState::Writing(future);
-                }
-                WriteState::Writing(fut) => {
-                    // poll the write future
-                    let mut future_pin = unsafe { Pin::new_unchecked(fut) };
-                    match future_pin.as_mut().poll(cx) {
-                        Poll::Pending => return Poll::Pending,
-
-                        Poll::Ready(res) => {
-                            // finish write: put websocket back
-                            self.write_state = WriteState::Idle;
-                            match res {
-                                Ok((websocket, ())) => {
-                                    self.websocket = Some(websocket);
-                                    let n = self.pending_write_len.take().unwrap_or(0);
-                                    return Poll::Ready(Ok(n));
-                                }
-                                Err(e) => return Poll::Ready(Err(make_io_err(e))),
-                            }
-                        }
-                    }
+                    self.pending_op = Some(PendingOp::Write(len));
+                    self.write_state =
+                        WriteState::Writing(write(websocket, payload, self.payload_type));
+                    // Loop back around to actually drive the future we just created.
                 }
             }
         }
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // If a write is in progress, poll it first.
-        match &mut self.write_state {
-            WriteState::Writing(_) => {
-                // let regular poll_write flow handle it; return Pending so caller
-                // should call poll_flush again later. Alternatively, we could
-                // poll it here explicitly, but reusing poll_write semantics is fine.
-                return Poll::Pending;
-            }
-            WriteState::Idle => {
-                // Start a new flush future by taking the websocket
-                let websocket = match self.websocket.take() {
-                    Some(websocket) => websocket,
-                    None => return Poll::Ready(Ok(())),
-                };
-                // empty payload for close
-                let future = flush(websocket);
-                self.write_state = WriteState::Writing(future);
-
-                // fallthrough to poll the just-created future
-            }
-        }
-
-        // Now poll the write future created above.
-        match &mut self.write_state {
-            WriteState::Writing(fut) => {
-                let mut fut_pin = unsafe { Pin::new_unchecked(fut) };
-                match fut_pin.as_mut().poll(cx) {
-                    Poll::Pending => Poll::Pending,
-                    Poll::Ready(res) => {
-                        self.write_state = WriteState::Idle;
-                        match res {
-                            Ok((websocket, ())) => {
-                                self.websocket = Some(websocket);
-                                Poll::Ready(Ok(()))
-                            }
-                            Err(e) => Poll::Ready(Err(make_io_err(e))),
+        loop {
+            match self.poll_drive(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Ready(Ok(Some(PendingOp::Flush))) => return Poll::Ready(Ok(())),
+                Poll::Ready(Ok(Some(_))) => {
+                    // A write/close that was already in flight just finished;
+                    // we still owe the caller an actual flush, so continue on.
+                    continue;
+                }
+                Poll::Ready(Ok(None)) => {
+                    let websocket = match self.websocket.take() {
+                        Some(websocket) => websocket,
+                        None => {
+                            return Poll::Ready(Err(io::Error::other("Websocket not available")));
                         }
-                    }
+                    };
+                    self.pending_op = Some(PendingOp::Flush);
+                    self.write_state = WriteState::Writing(flush(websocket));
                 }
             }
-            _ => Poll::Ready(Ok(())),
         }
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // Implement shutdown by sending a Close frame synchronously via the
-        // same state-machine approach: start a write future that sends close.
-        // If a write is already in progress, wait for it to complete first.
-
-        // If a write is in progress, poll it first.
-        match &mut self.write_state {
-            WriteState::Writing(_) => {
-                // let regular poll_write flow handle it; return Pending so caller
-                // should call poll_shutdown again later. Alternatively, we could
-                // poll it here explicitly, but reusing poll_write semantics is fine.
-                return Poll::Pending;
-            }
-            WriteState::Idle => {
-                // start a close write
-                let websocket = match self.websocket.take() {
-                    Some(websocket) => websocket,
-                    None => return Poll::Ready(Ok(())),
-                };
-                // empty payload for close
-                let future = close(websocket);
-                self.write_state = WriteState::Writing(future);
-
-                // fallthrough to poll the just-created future
-            }
-        }
-
-        // Now poll the write future created above.
-        match &mut self.write_state {
-            WriteState::Writing(fut) => {
-                let mut fut_pin = unsafe { Pin::new_unchecked(fut) };
-                match fut_pin.as_mut().poll(cx) {
-                    Poll::Pending => Poll::Pending,
-                    Poll::Ready(res) => {
-                        self.write_state = WriteState::Idle;
-                        match res {
-                            Ok((websocket, ())) => {
-                                self.websocket = Some(websocket);
-                                Poll::Ready(Ok(()))
-                            }
-                            Err(e) => Poll::Ready(Err(make_io_err(e))),
+        // Implemented by sending a Close frame through the same state machine
+        // used for regular writes/flushes.
+        loop {
+            match self.poll_drive(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Ready(Ok(Some(PendingOp::Close))) => return Poll::Ready(Ok(())),
+                Poll::Ready(Ok(Some(_))) => {
+                    // A write/flush that was already in flight just finished;
+                    // we still owe the caller an actual close, so continue on.
+                    continue;
+                }
+                Poll::Ready(Ok(None)) => {
+                    let websocket = match self.websocket.take() {
+                        Some(websocket) => websocket,
+                        None => {
+                            return Poll::Ready(Err(io::Error::other("Websocket not available")));
                         }
-                    }
+                    };
+                    self.pending_op = Some(PendingOp::Close);
+                    self.write_state = WriteState::Writing(close(websocket));
                 }
             }
-            _ => Poll::Ready(Ok(())),
         }
     }
 }
@@ -605,11 +605,20 @@ impl<S> Debug for WebSocketStream<S> {
             }
         }
 
+        fn pending_op_name(op: &Option<PendingOp>) -> &'static str {
+            match op {
+                None => "None",
+                Some(PendingOp::Write(_)) => "Write",
+                Some(PendingOp::Flush) => "Flush",
+                Some(PendingOp::Close) => "Close",
+            }
+        }
+
         f.debug_struct("WebSocketStream")
             .field("read_buf_len", &self.read_buf.len())
             .field("read_state", &read_state_name(&self.read_state))
             .field("write_state", &write_state_name(&self.write_state))
-            .field("pending_write_len", &self.pending_write_len)
+            .field("pending_op", &pending_op_name(&self.pending_op))
             .field("closed", &self.closed)
             .finish()
     }
