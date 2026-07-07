@@ -19,90 +19,89 @@ WebSocket framing.
   underlying `fastwebsockets` settings.
 - Integrates seamlessly with the [`fastwebsockets`] crate and `tokio` ecosystem.
 
-##  Example: Server
+##  Example
 
 ```rust
-use fastwebsockets::{upgrade, WebSocketError};
+
+use fastwebsockets::{WebSocketError, handshake, upgrade};
 use fastwebsockets_stream::{PayloadType, WebSocketStream};
-use hyper::{Request, Response};
-use hyper::body::{Bytes, Incoming};
+use http_body_util::Empty;
+use hyper::body::Bytes;
+use hyper::body::Incoming;
+use hyper::header::{CONNECTION, UPGRADE};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
+use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
-use http_body_util::Empty;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::future::Future;
 use std::net::Ipv4Addr;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 
-#[tokio::test]
-async fn server_example() {
-    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0u16))
-        .await
-        .unwrap();
+struct SpawnExecutor;
+impl<F> hyper::rt::Executor<F> for SpawnExecutor
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    fn execute(&self, fut: F) {
+        tokio::task::spawn(fut);
+    }
+}
+// Server-side connection handler: upgrades the request, then echoes a
+// single binary message back to the client over `WebSocketStream`.
+async fn handle(mut request: Request<Incoming>) -> Result<Response<Empty<Bytes>>, WebSocketError> {
+    assert!(upgrade::is_upgrade_request(&request));
+    let (response, ws_fut) = upgrade::upgrade(&mut request)?;
+    tokio::spawn(async move {
+        let ws = ws_fut.await.unwrap();
+        let mut ws_stream = WebSocketStream::new(ws, PayloadType::Binary);
+        let mut buf = [0u8; 6];
+        ws_stream.read_exact(&mut buf).await.unwrap();
+        ws_stream.write_all(&buf).await.unwrap();
+        ws_stream.shutdown().await.unwrap();
+    });
+    Ok(response)
+}
+#[tokio::main]
+async fn main() {
+    // Bind an ephemeral local port and remember the address we actually got.
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0u16)).await.unwrap();
     let addr = listener.local_addr().unwrap();
-
+    // Accept and upgrade incoming connections in the background.
     tokio::spawn(async move {
         loop {
             let (stream, _) = listener.accept().await.unwrap();
             let io = TokioIo::new(stream);
             tokio::spawn(async move {
-                if let Err(err) = http1::Builder::new()
+                let _ = http1::Builder::new()
                     .serve_connection(io, service_fn(handle))
                     .with_upgrades()
-                    .await
-                {
-                    eprintln!("Error: {:?}", err);
-                }
+                    .await;
             });
         }
     });
-
-    println!("Server listening on {}", addr);
-}
-
-async fn handle(mut req: Request<Incoming>) -> Result<Response<Empty<Bytes>>, WebSocketError> {
-    assert!(upgrade::is_upgrade_request(&req));
-    let (resp, ws_fut) = upgrade::upgrade(&mut req)?;
-    tokio::spawn(async move {
-        let mut buf = [0u8; 6];
-        let websocket = ws_fut.await.unwrap();
-        let mut ws_stream = WebSocketStream::new(websocket, PayloadType::Binary);
-        ws_stream.write(b"Hello!").await.unwrap();
-        ws_stream.read(&mut buf).await.unwrap();
-        assert_eq!(&buf, b"Hello!");
-    });
-    Ok(resp)
-}
-```
-
-## Example: Client
-
-```rust
-use fastwebsockets::{Frame, OpCode, handshake};
-use fastwebsockets_stream::{PayloadType, WebSocketStream};
-use http_body_util::Empty;
-use hyper::header::{UPGRADE, CONNECTION};
-use hyper::body::Bytes;
-use tokio::net::TcpStream;
-
-#[tokio::test]
-async fn client_example() {
-    let addr = "127.0.0.1:9000";
+    // Client: connect to the port the server actually bound above.
     let stream = TcpStream::connect(addr).await.unwrap();
-    let request = http::Request::builder()
+    let request = Request::builder()
         .method("GET")
-        .uri("ws://127.0.0.1:9000")
-        .header("Host", "127.0.0.1")
+        .uri(format!("ws://{addr}"))
+        .header("Host", addr.to_string())
         .header(UPGRADE, "websocket")
         .header(CONNECTION, "upgrade")
         .header("Sec-WebSocket-Key", handshake::generate_key())
         .header("Sec-WebSocket-Version", "13")
         .body(Empty::<Bytes>::new())
         .unwrap();
-
-    let (mut ws, _) = handshake::client(&tokio::task::spawn, request, stream).await.unwrap();
-    let msg = ws.read_frame().await.unwrap();
-    assert_eq!(msg.opcode, OpCode::Binary);
-    ws.write_frame(Frame::binary(msg.payload)).await.unwrap();
+    let (ws, _response) = handshake::client(&SpawnExecutor, request, stream)
+        .await
+        .unwrap();
+    let mut ws_stream = WebSocketStream::new(ws, PayloadType::Binary);
+    let n = ws_stream.write(b"Hello!").await.unwrap();
+    assert_eq!(n, 6);
+    let mut buf = [0u8; 6];
+    ws_stream.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"Hello!");
 }
 ```
 
