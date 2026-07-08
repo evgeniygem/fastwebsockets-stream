@@ -1,6 +1,6 @@
 [package]
 name = "fastwebsockets-stream"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 authors = ["Evgeniy Zakharov <eugenezakharov7@gmail.com"]
 description = """
@@ -43,8 +43,20 @@ name = "error"
 path = "tests/error.rs"
 
 [[test]]
+name = "error_consistency"
+path = "tests/error_consistency.rs"
+
+[[test]]
+name = "fragmentation"
+path = "tests/fragmentation.rs"
+
+[[test]]
 name = "framed"
 path = "tests/framed.rs"
+
+[[test]]
+name = "lifecycle"
+path = "tests/lifecycle.rs"
 
 [[test]]
 name = "ping"

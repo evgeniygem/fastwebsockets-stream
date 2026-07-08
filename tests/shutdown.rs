@@ -66,7 +66,7 @@ where
 /// termination initiated by the server, ensuring that clients receive the appropriate
 /// Close frame and can handle graceful connection teardown.
 #[tokio::test]
-async fn text_stream() {
+async fn shutdown_stream() {
     // Bind to an ephemeral port on localhost.
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0u16))
         .await
